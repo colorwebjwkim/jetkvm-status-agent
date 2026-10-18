@@ -1,0 +1,8 @@
+.local/
+dist/
+verification/
+config.json
+*.key
+*.pem
+*.test
+coverage.out

@@ -1,0 +1,8 @@
+{
+  "httpListen": "127.0.0.1:9080",
+  "mqttBroker": "tcp://127.0.0.1:1883",
+  "topicPrefix": "jetkvm/REPLACE_WITH_DEVICE_ID",
+  "staleAfterSeconds": 45,
+  "tlsCert": "",
+  "tlsKey": ""
+}
