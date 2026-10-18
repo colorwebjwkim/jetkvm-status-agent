@@ -12,12 +12,16 @@ import (
 )
 
 type Config struct {
-	HTTPListen        string `json:"httpListen"`
-	MQTTBroker        string `json:"mqttBroker"`
-	TopicPrefix       string `json:"topicPrefix"`
-	StaleAfterSeconds int    `json:"staleAfterSeconds"`
-	TLSCert           string `json:"tlsCert"`
-	TLSKey            string `json:"tlsKey"`
+	MQTTListen          string `json:"mqttListen"`
+	DeviceClientID      string `json:"deviceClientId"`
+	RelayBroker         string `json:"relayBroker"`
+	RelayAllowPlaintext bool   `json:"relayAllowPlaintext"`
+	HTTPListen          string `json:"httpListen"`
+	MQTTBroker          string `json:"mqttBroker"`
+	TopicPrefix         string `json:"topicPrefix"`
+	StaleAfterSeconds   int    `json:"staleAfterSeconds"`
+	TLSCert             string `json:"tlsCert"`
+	TLSKey              string `json:"tlsKey"`
 }
 
 func LoadConfig(path string) (Config, error) {
@@ -46,6 +50,49 @@ func LoadConfig(path string) (Config, error) {
 }
 
 func (c Config) Validate() error {
+	if c.MQTTListen != "" {
+		host, port, err := net.SplitHostPort(c.MQTTListen)
+		if err != nil || net.ParseIP(host) == nil || !net.ParseIP(host).IsLoopback() || c.DeviceClientID == "" {
+			return errors.New("mqttListen requires numeric loopback and deviceClientId")
+		}
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return errors.New("invalid embedded MQTT port")
+		}
+	}
+	if c.RelayBroker != "" {
+		if c.MQTTListen == "" {
+			return errors.New("relay requires embedded MQTT input to prevent broker feedback loops")
+		}
+		u, err := url.Parse(c.RelayBroker)
+		if err != nil || u.Hostname() == "" || u.User != nil || (u.Scheme != "tcp" && u.Scheme != "ssl") || u.Path != "" || u.RawQuery != "" {
+			return errors.New("invalid relayBroker")
+		}
+		if u.Scheme == "tcp" && !c.RelayAllowPlaintext {
+			return errors.New("plain relay requires explicit relayAllowPlaintext on trusted LAN")
+		}
+		if c.RelayBroker == c.MQTTBroker {
+			return errors.New("relay source and destination must differ")
+		}
+		if c.MQTTListen != "" && u.Host == c.MQTTListen {
+			return errors.New("relay cannot target embedded broker")
+		}
+		if c.MQTTListen != "" {
+			_, port, _ := net.SplitHostPort(c.MQTTListen)
+			destIP := net.ParseIP(u.Hostname())
+			destPort := u.Port()
+			if destPort == "" {
+				if u.Scheme == "ssl" {
+					destPort = "8883"
+				} else {
+					destPort = "1883"
+				}
+			}
+			if port == destPort && (u.Hostname() == "localhost" || destIP != nil && destIP.IsLoopback()) {
+				return errors.New("relay loopback loop rejected")
+			}
+		}
+	}
 	host, port, e := net.SplitHostPort(c.HTTPListen)
 	if e != nil || port == "" {
 		return errors.New("httpListen must be host:port")
@@ -61,13 +108,15 @@ func (c Config) Validate() error {
 	if (ip == nil || !ip.IsLoopback()) && c.TLSCert == "" {
 		return errors.New("non-loopback HTTP requires TLS")
 	}
-	u, e := url.Parse(c.MQTTBroker)
-	if e != nil || u.Hostname() == "" || u.User != nil || (u.Scheme != "tcp" && u.Scheme != "ssl") {
-		return errors.New("mqttBroker must be tcp:// or ssl:// without credentials")
-	}
-	ip = net.ParseIP(u.Hostname())
-	if u.Scheme == "tcp" && (ip == nil || !ip.IsLoopback()) {
-		return errors.New("remote MQTT requires ssl://")
+	if c.MQTTListen == "" {
+		u, e := url.Parse(c.MQTTBroker)
+		if e != nil || u.Hostname() == "" || u.User != nil || (u.Scheme != "tcp" && u.Scheme != "ssl") {
+			return errors.New("mqttBroker must be tcp:// or ssl:// without credentials")
+		}
+		ip = net.ParseIP(u.Hostname())
+		if u.Scheme == "tcp" && (ip == nil || !ip.IsLoopback()) {
+			return errors.New("remote MQTT requires ssl://")
+		}
 	}
 	if c.TopicPrefix == "" || strings.ContainsAny(c.TopicPrefix, "+#\x00 ") || strings.HasSuffix(c.TopicPrefix, "/") {
 		return errors.New("invalid exact device topicPrefix")

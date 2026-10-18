@@ -36,47 +36,64 @@ func main() {
 	}
 	store := agent.NewStore(time.Duration(cfg.StaleAfterSeconds) * time.Second)
 	store.Error("mqtt_connecting")
-	deviceHash := sha256.Sum256([]byte(cfg.TopicPrefix))
-	opts := mqtt.NewClientOptions().AddBroker(cfg.MQTTBroker).SetClientID(fmt.Sprintf("status-agent-%x", deviceHash[:6])).SetCleanSession(true)
-	opts.SetUsername(os.Getenv("JETKVM_MQTT_USERNAME")).SetPassword(os.Getenv("JETKVM_MQTT_PASSWORD"))
-	opts.SetTLSConfig(&tls.Config{MinVersion: tls.VersionTLS12})
-	opts.SetConnectTimeout(5 * time.Second).SetAutoReconnect(true).SetConnectRetry(true).SetConnectRetryInterval(5 * time.Second)
-	opts.SetKeepAlive(20 * time.Second).SetPingTimeout(5 * time.Second)
-	opts.SetOnConnectHandler(func(c mqtt.Client) {
-		store.Connection(true)
-		topics := map[string]byte{}
-		for _, suffix := range []string{"/status", "/atx/state", "/dc/state", "/sessions/state"} {
-			topics[cfg.TopicPrefix+suffix] = 1
+	relay := agent.StartRelay(cfg, store)
+	defer relay.Close()
+	var client mqtt.Client
+	if cfg.MQTTListen != "" {
+		localBroker, err := agent.StartBroker(cfg, store, relay)
+		if err != nil {
+			log.Fatal("local MQTT listener failed: ", err)
 		}
-		t := c.SubscribeMultiple(topics, func(_ mqtt.Client, m mqtt.Message) {
-			if len(m.Payload()) > 16384 {
-				store.Error("payload_too_large")
-				return
+		defer localBroker.Close()
+	} else {
+		deviceHash := sha256.Sum256([]byte(cfg.TopicPrefix))
+		opts := mqtt.NewClientOptions().AddBroker(cfg.MQTTBroker).SetClientID(fmt.Sprintf("status-agent-%x", deviceHash[:6])).SetCleanSession(true)
+		opts.SetUsername(os.Getenv("JETKVM_MQTT_USERNAME")).SetPassword(os.Getenv("JETKVM_MQTT_PASSWORD"))
+		opts.SetTLSConfig(&tls.Config{MinVersion: tls.VersionTLS12})
+		opts.SetConnectTimeout(5 * time.Second).SetAutoReconnect(true).SetConnectRetry(true).SetConnectRetryInterval(5 * time.Second)
+		opts.SetKeepAlive(20 * time.Second).SetPingTimeout(5 * time.Second)
+		opts.SetOnConnectHandler(func(c mqtt.Client) {
+			store.Connection(true)
+			topics := map[string]byte{}
+			for _, suffix := range []string{"/status", "/atx/state", "/dc/state", "/sessions/state"} {
+				topics[cfg.TopicPrefix+suffix] = 1
 			}
-			if store.Apply(strings.TrimPrefix(m.Topic(), cfg.TopicPrefix), m.Payload(), m.Retained(), time.Now().UTC()) != nil {
-				store.Error("invalid_payload")
-			}
-		})
-		go func() {
-			if !t.WaitTimeout(10*time.Second) || t.Error() != nil {
-				store.Connection(false)
-				store.Error("subscribe_failed")
-				return
-			}
-			if subscription, ok := t.(*mqtt.SubscribeToken); ok {
-				for _, result := range subscription.Result() {
-					if result == 0x80 {
-						store.Connection(false)
-						store.Error("subscribe_denied")
-						return
+			t := c.SubscribeMultiple(topics, func(_ mqtt.Client, m mqtt.Message) {
+				if len(m.Payload()) > 16384 {
+					store.Reject(strings.TrimPrefix(m.Topic(), cfg.TopicPrefix), "payload_too_large")
+					relay.Notify()
+					return
+				}
+				if store.Apply(strings.TrimPrefix(m.Topic(), cfg.TopicPrefix), m.Payload(), m.Retained(), time.Now().UTC()) != nil {
+					store.Reject(strings.TrimPrefix(m.Topic(), cfg.TopicPrefix), "invalid_payload")
+				}
+				relay.Notify()
+			})
+			go func() {
+				if !t.WaitTimeout(10*time.Second) || t.Error() != nil {
+					store.Connection(false)
+					store.Error("subscribe_failed")
+					return
+				}
+				if subscription, ok := t.(*mqtt.SubscribeToken); ok {
+					for _, result := range subscription.Result() {
+						if result == 0x80 {
+							store.Connection(false)
+							store.Error("subscribe_denied")
+							return
+						}
 					}
 				}
-			}
-		}()
-	})
-	opts.SetConnectionLostHandler(func(_ mqtt.Client, _ error) { store.Connection(false); store.Error("mqtt_disconnected") })
-	client := mqtt.NewClient(opts)
-	client.Connect()
+			}()
+		})
+		opts.SetConnectionLostHandler(func(_ mqtt.Client, _ error) {
+			store.Connection(false)
+			store.Error("mqtt_disconnected")
+			relay.Notify()
+		})
+		client = mqtt.NewClient(opts)
+		client.Connect()
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	srv := &http.Server{Addr: cfg.HTTPListen, Handler: agent.Handler(store, token), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 8192}
@@ -92,7 +109,9 @@ func main() {
 	} else {
 		err = srv.ListenAndServe()
 	}
-	client.Disconnect(250)
+	if client != nil {
+		client.Disconnect(250)
+	}
 	if err != http.ErrServerClosed {
 		log.Fatal(err)
 	}

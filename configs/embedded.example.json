@@ -1,0 +1,11 @@
+{
+  "httpListen": "127.0.0.1:9080",
+  "mqttListen": "127.0.0.1:1883",
+  "deviceClientId": "jetkvm-REPLACE_WITH_DEVICE_ID",
+  "topicPrefix": "jetkvm/REPLACE_WITH_DEVICE_ID",
+  "relayBroker": "tcp://REPLACE_WITH_PC_ADDRESS:1883",
+  "relayAllowPlaintext": true,
+  "staleAfterSeconds": 45,
+  "tlsCert": "",
+  "tlsKey": ""
+}

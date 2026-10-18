@@ -66,6 +66,28 @@ func TestAPI(t *testing.T) {
 		}
 	}
 }
+
+func TestExplicitOfflineReport(t *testing.T) {
+	s := NewStore(time.Minute)
+	now := time.Now()
+	s.Connection(true)
+	s.Apply("/atx/state", []byte(`{"power":true}`), false, now)
+	s.Apply("/status", []byte(`{"online":false}`), false, now)
+	encoded := snapshot(s, now)
+	var result map[string]json.RawMessage
+	json.Unmarshal([]byte(encoded), &result)
+	var device struct {
+		Online Reading `json:"online"`
+	}
+	json.Unmarshal(result["device"], &device)
+	var power struct {
+		ATX Reading `json:"atx"`
+	}
+	json.Unmarshal(result["power"], &power)
+	if device.Online.Freshness != "fresh" || power.ATX.Freshness != "stale" {
+		t.Fatal(encoded)
+	}
+}
 func TestConfig(t *testing.T) {
 	c := Config{HTTPListen: "127.0.0.1:9080", MQTTBroker: "tcp://127.0.0.1:1883", TopicPrefix: "jetkvm/device", StaleAfterSeconds: 45}
 	if c.Validate() != nil {

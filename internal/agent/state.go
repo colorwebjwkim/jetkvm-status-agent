@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-const Version = "0.1.0"
+const Version = "0.2.0"
 
 type Reading struct {
 	Value            any        `json:"value"`
@@ -21,20 +21,31 @@ type Store struct {
 	connected bool
 	lastError string
 	readings  map[string]Reading
+	invalid   map[string]bool
 	ttl       time.Duration
+	relay     RelayStatus
 }
 
-func NewStore(ttl time.Duration) *Store { return &Store{readings: map[string]Reading{}, ttl: ttl} }
+func NewStore(ttl time.Duration) *Store {
+	return &Store{readings: map[string]Reading{}, invalid: map[string]bool{}, ttl: ttl}
+}
 func (s *Store) Connection(connected bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.connected = connected
 	if connected {
 		s.readings = map[string]Reading{}
+		s.invalid = map[string]bool{}
 		s.lastError = ""
 	}
 }
 func (s *Store) Error(code string) { s.mu.Lock(); defer s.mu.Unlock(); s.lastError = code }
+func (s *Store) Reject(suffix, code string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.invalid[suffix] = true
+	s.lastError = code
+}
 func (s *Store) Apply(suffix string, payload []byte, retained bool, now time.Time) error {
 	var value any
 	switch suffix {
@@ -76,6 +87,7 @@ func (s *Store) Apply(suffix string, payload []byte, retained bool, now time.Tim
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.readings[suffix] = Reading{Value: value, ReceivedAt: &now, Retained: retained}
+	delete(s.invalid, suffix)
 	s.lastError = ""
 	return nil
 }
@@ -85,9 +97,9 @@ func (s *Store) Snapshot(now time.Time) any {
 	get := func(key string) Reading {
 		v := s.readings[key]
 		v.Freshness = "unknown"
-		if v.ReceivedAt != nil && !v.Retained {
+		if v.ReceivedAt != nil && !v.Retained && !s.invalid[key] {
 			v.Freshness = "stale"
-			if s.connected && now.Sub(*v.ReceivedAt) <= s.ttl {
+			if s.connected && (key == "/status" || s.readings["/status"].Value != false) && now.Sub(*v.ReceivedAt) <= s.ttl {
 				v.Freshness = "fresh"
 			}
 		}
@@ -99,5 +111,20 @@ func (s *Store) Snapshot(now time.Time) any {
 		"device":        map[string]any{"online": get("/status"), "extension": "unknown", "extensionVerified": false},
 		"power":         map[string]any{"atx": get("/atx/state"), "dc": get("/dc/state"), "usableForControl": false},
 		"sessions":      get("/sessions/state"),
+		"relay":         s.relay,
 	}
+}
+
+// RelayInput never treats retained or expired readings as a current session count.
+func (s *Store) RelayInput(now time.Time) (int, time.Time, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	online := s.readings["/status"]
+	sessions := s.readings["/sessions/state"]
+	count, ok := sessions.Value.(int)
+	valid := ok && s.connected && !s.invalid["/status"] && !s.invalid["/sessions/state"] && online.Value == true && !online.Retained && !sessions.Retained && sessions.ReceivedAt != nil && now.Sub(*sessions.ReceivedAt) <= s.ttl
+	if !valid {
+		return 0, time.Time{}, false
+	}
+	return count, *sessions.ReceivedAt, true
 }

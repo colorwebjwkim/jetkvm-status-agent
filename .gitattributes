@@ -1,0 +1,2 @@
+*.sh text eol=lf
+scripts/S23jetkvm-status-agent text eol=lf
